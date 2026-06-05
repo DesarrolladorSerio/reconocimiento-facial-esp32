@@ -3,17 +3,37 @@ import face_recognition
 import numpy as np
 import os
 import time
+import json
+import urllib.request  
+import paho.mqtt.client as mqtt
 
-# 1. Configuración de la conexión al ESP32-CAM
-# NOTA: El puerto 81 es el estándar para el streaming de video en el CameraWebServer
-ESP32_URL = "http://172.26.75.77:81/stream"  # <--- CAMBIA ESTO POR TU IP
+# ====================================================================
+# --- CONFIGURACIÓN DE PARÁMETROS ---
+# ====================================================================
 
-# 2. Cargar las caras conocidas
+# IP actual de tu ESP32-CAM (Usando /capture para fotos estáticas)
+ESP32_URL = "http://10.36.94.253/capture" 
+
+# Broker público de internet
+MQTT_BROKER = "broker.hivemq.com"                    
+MQTT_PORT = 1883
+MQTT_TOPIC = "smarthome/equipoXX/camara"  # <-- Cambia XX por tu número de equipo
+
+# ====================================================================
+# --- CONEXIÓN AL BROKER MQTT ---
+# ====================================================================
+print("Conectando al Broker HiveMQ...")
+mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt_client.loop_start()  # Inicia el cliente MQTT en segundo plano
+
+# ====================================================================
+# --- CARGAR BASE DE DATOS DE ROSTROS ---
+# ====================================================================
 print("Cargando base de datos de rostros...")
 caras_conocidas_encodings = []
 nombres_conocidos = []
 
-# Nombres y rutas de las imágenes que guardaste
 archivos_caras = {
     "Augusto": "caras_conocidas/Augusto.jpeg",
     "Boris": "caras_conocidas/Boris.jpeg",
@@ -23,68 +43,102 @@ archivos_caras = {
 for nombre, ruta in archivos_caras.items():
     if os.path.exists(ruta):
         imagen = face_recognition.load_image_file(ruta)
-        # Obtenemos la codificación facial de la imagen
         encoding = face_recognition.face_encodings(imagen)[0]
         caras_conocidas_encodings.append(encoding)
         nombres_conocidos.append(nombre)
+        print(f" Rostro de [{nombre}] cargado exitosamente.")
     else:
         print(f"Advertencia: No se encontró la imagen {ruta}")
 
-print("Iniciando conexión con la cámara...")
-video_capture = cv2.VideoCapture(ESP32_URL)
-video_capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-video_capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+# ====================================================================
+# --- BUCLE PRINCIPAL DE RECONOCIMIENTO EN VIVO ---
+# ====================================================================
+print("\nIniciando bucle de captura de rostros (Ametralladora HTTP)...")
+ultima_notificacion = ""
+tiempo_ultimo_envio = 0
 
-if not video_capture.isOpened():
-    print("Error: No se pudo conectar al stream del ESP32. Revisa la IP y la red.")
-    exit()
-
-# 3. Bucle principal de lectura y reconocimiento
 while True:
-    # Leer el frame actual del stream
-    ret, frame = video_capture.read()
-    if not ret:
-        print("Frame perdido, reintentando...")
+    try:
+        # Abrimos y cerramos la conexión HTTP de inmediato para no congelar el buffer de la cámara
+        with urllib.request.urlopen(ESP32_URL, timeout=2) as img_resp:
+            img_bytes = bytearray(img_resp.read())
+        
+        # Convertimos los bytes en una matriz que OpenCV entienda
+        img_np = np.array(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(img_np, -1)
+        
+        if frame is None:
+            print("Frame vacío o corrupto, reintentando...")
+            continue
+            
+    except Exception as e:
+        print(f"Error al obtener imagen desde la cámara: {e}")
         time.sleep(0.1)
         continue
 
-    # Reducir el tamaño del frame a 1/4 para que el procesamiento sea mucho más rápido
+    # Redimensionar el cuadro a 1/4 para acelerar drásticamente el procesamiento
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-
-    # Convertir la imagen de BGR (que usa OpenCV) a RGB (que usa face_recognition)
     rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-    # Encontrar todas las caras y sus codificaciones en el frame actual
+    # Localizar y codificar rostros presentes en la imagen
     face_locations = face_recognition.face_locations(rgb_small_frame)
     face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-    # Iterar sobre cada cara detectada
-    for face_encoding in face_encodings:
-        # Ver si la cara coincide con alguna de las conocidas
+    nombre_detectado = "Ninguno"
+
+    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
         matches = face_recognition.compare_faces(caras_conocidas_encodings, face_encoding)
         nombre_detectado = "Desconocido"
 
-        # Calcular la distancia euclidiana para encontrar el mejor match (el más parecido)
         face_distances = face_recognition.face_distance(caras_conocidas_encodings, face_encoding)
-        
+
         if len(face_distances) > 0:
             mejor_match_index = np.argmin(face_distances)
-            
-            # Si hay un match suficientemente cercano, verificamos la identidad
+
             if matches[mejor_match_index]:
                 nombre_detectado = nombres_conocidos[mejor_match_index]
-                
-                # ¡AQUÍ ESTÁ EL MENSAJE DE VERIFICACIÓN!
-                # Puedes reemplazar este print por un insert a una base de datos SQL o un log
-                print(f"*** {nombre_detectado} verificado ***")
+                print(f" {nombre_detectado} verificado frente a la cámara ")
 
-    # (Opcional) Mostrar el video en una ventana en tu monitor para ver qué está pasando
+        # Escalamos los recuadros de vuelta al tamaño original (1/4 * 4)
+        top *= 4
+        right *= 4
+        bottom *= 4
+        left *= 4
+
+        # Cambiar color según reconocimiento: Verde para conocidos, Rojo para desconocidos
+        color_recuadro = (0, 255, 0) if nombre_detectado != "Desconocido" else (0, 0, 255)
+
+        # Dibujar rectángulos y nombres en la ventana local de la PC
+        cv2.rectangle(frame, (left, top), (right, bottom), color_recuadro, 2)
+        cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color_recuadro, cv2.FILLED)
+        cv2.putText(frame, nombre_detectado, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+
+    # Lógica de notificación MQTT (Envía si cambia de estado o cada 3 segundos si se mantiene fijo)
+    ahora = time.time()
+    if nombre_detectado != ultima_notificacion or (ahora - tiempo_ultimo_envio) > 3:
+
+        datos_camara = {
+            "movimiento": 1 if nombre_detectado != "Ninguno" else 0,
+            "persona": nombre_detectado,
+            "estado": "Alerta" if nombre_detectado == "Desconocido" else "Seguro" if nombre_detectado != "Ninguno" else "Monitoreando"
+        }
+
+        # Publicar el JSON hacia el broker para Node-RED
+        mqtt_client.publish(MQTT_TOPIC, json.dumps(datos_camara))
+        print(f"[MQTT] Publicado en {MQTT_TOPIC}: {datos_camara}")
+
+        ultima_notificacion = nombre_detectado
+        tiempo_ultimo_envio = ahora
+
+    # Dibujar la ventana con el video en vivo localmente en tu computadora
     cv2.imshow('Video ESP32-CAM', frame)
 
-    # Presionar 'q' para salir del bucle
+    # Requisito de OpenCV para procesar la ventana y permitir salir con la tecla 'q'
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Limpiar al salir
-video_capture.release()
+# Limpieza final al cerrar
 cv2.destroyAllWindows()
+mqtt_client.loop_stop()
+mqtt_client.disconnect()
+print("Proceso finalizado con éxito.")
