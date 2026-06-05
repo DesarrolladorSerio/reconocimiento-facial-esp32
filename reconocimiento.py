@@ -53,27 +53,50 @@ for nombre, ruta in archivos_caras.items():
 # ====================================================================
 # --- BUCLE PRINCIPAL DE RECONOCIMIENTO EN VIVO ---
 # ====================================================================
-print("\nIniciando bucle de captura de rostros (Ametralladora HTTP)...")
+# Intervalo mínimo entre capturas (segundos). ~3 fps es suficiente para
+# reconocimiento facial y evita saturar el ESP32-CAM.
+FRAME_INTERVAL = 0.35
+
+# Parámetros de backoff exponencial al recibir errores consecutivos
+errores_consecutivos = 0
+MAX_BACKOFF = 5.0   # segundos máximo de espera
+
+print("\nIniciando bucle de captura de rostros (throttled a ~3 fps)...")
 ultima_notificacion = ""
 tiempo_ultimo_envio = 0
+tiempo_ultimo_frame = 0
 
 while True:
+    # --- Control de velocidad: respetar FRAME_INTERVAL entre capturas ---
+    ahora = time.time()
+    tiempo_a_esperar = FRAME_INTERVAL - (ahora - tiempo_ultimo_frame)
+    if tiempo_a_esperar > 0:
+        time.sleep(tiempo_a_esperar)
+    tiempo_ultimo_frame = time.time()
+
     try:
-        # Abrimos y cerramos la conexión HTTP de inmediato para no congelar el buffer de la cámara
-        with urllib.request.urlopen(ESP32_URL, timeout=2) as img_resp:
+        # Timeout generoso (5 s) para no acumular conexiones colgadas
+        req = urllib.request.Request(ESP32_URL, headers={"Connection": "close"})
+        with urllib.request.urlopen(req, timeout=5) as img_resp:
             img_bytes = bytearray(img_resp.read())
-        
+
+        # Reset del contador de errores al tener éxito
+        errores_consecutivos = 0
+
         # Convertimos los bytes en una matriz que OpenCV entienda
         img_np = np.array(img_bytes, dtype=np.uint8)
         frame = cv2.imdecode(img_np, -1)
-        
+
         if frame is None:
             print("Frame vacío o corrupto, reintentando...")
             continue
-            
+
     except Exception as e:
-        print(f"Error al obtener imagen desde la cámara: {e}")
-        time.sleep(0.1)
+        errores_consecutivos += 1
+        # Backoff exponencial: 0.5 s, 1 s, 2 s, 4 s, 5 s (tope)
+        espera = min(0.5 * (2 ** (errores_consecutivos - 1)), MAX_BACKOFF)
+        print(f"Error al obtener imagen ({errores_consecutivos} consecutivo/s): {e} — esperando {espera:.1f}s")
+        time.sleep(espera)
         continue
 
     # Redimensionar el cuadro a 1/4 para acelerar drásticamente el procesamiento
@@ -115,7 +138,7 @@ while True:
 
     # Lógica de notificación MQTT (Envía si cambia de estado o cada 3 segundos si se mantiene fijo)
     ahora = time.time()
-    if nombre_detectado != ultima_notificacion or (ahora - tiempo_ultimo_envio) > 3:
+    if nombre_detectado != ultima_notificacion or (ahora - tiempo_ultimo_envio) > 3.0:
 
         datos_camara = {
             "movimiento": 1 if nombre_detectado != "Ninguno" else 0,
